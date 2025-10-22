@@ -281,11 +281,11 @@ class CausalWanAttentionBlock(nn.Module):
                                     context_lens, crossattn_cache=crossattn_cache)
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
-                 frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
+                    frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
             )
             # with amp.autocast(dtype=torch.float32):
             x = x + (y.unflatten(dim=1, sizes=(num_frames,
-                     frame_seqlen)) * e[5]).flatten(1, 2)
+                        frame_seqlen)) * e[5]).flatten(1, 2)
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
