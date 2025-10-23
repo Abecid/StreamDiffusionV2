@@ -17,6 +17,68 @@ def mps_gather_workaround(input, dim, index):
         return torch.gather(input, dim, index)
 
 
+def bipartite_soft_matching(
+    metric: torch.Tensor,
+    r: int,
+) -> Tuple[Callable, Callable]:
+    """
+    Applies ToMe with a balanced matching set (50%, 50%).
+
+    Input size is [batch, tokens, channels].
+    r indicates the number of tokens to remove (max 50% of tokens).
+
+    Extra args:
+     - class_token: Whether or not there's a class token.
+     - distill_token: Whether or not there's also a distillation token.
+
+    When enabled, the class token and distillation tokens won't get merged.
+    """
+    # We can only reduce by a maximum of 50% tokens
+    t = metric.shape[1]
+    r = min(r, t // 2)
+
+    if r <= 0:
+        return do_nothing, do_nothing
+
+    with torch.no_grad():
+        metric = metric / metric.norm(dim=-1, keepdim=True)
+        a, b = metric[..., ::2, :], metric[..., 1::2, :]
+        scores = a @ b.transpose(-1, -2)
+
+        node_max, node_idx = scores.max(dim=-1)
+        edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
+
+        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
+        src_idx = edge_idx[..., :r, :]  # Merged Tokens
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = x[..., ::2, :], x[..., 1::2, :]
+        n, t1, c = src.shape
+        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+
+        return torch.cat([unm, dst], dim=1)
+
+    def unmerge(x: torch.Tensor) -> torch.Tensor:
+        unm_len = unm_idx.shape[1]
+        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+        n, _, c = unm.shape
+
+        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
+
+        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
+
+        out[..., 1::2, :] = dst
+        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
+        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+
+        return out
+
+    return merge, unmerge
+
+
 def bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      w: int, h: int, sx: int, sy: int, r: int,
                                      no_rand: bool = False,

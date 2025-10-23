@@ -8,68 +8,23 @@ from .utils import isinstance_str, init_generator
 
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable, ...]:
-    original_h, original_w = tome_info["size"]
-    original_tokens = original_h * original_w
-    downsample = int(math.ceil(math.sqrt(original_tokens // x.shape[1])))
-
     args = tome_info["args"]
 
-    if downsample <= args["max_downsample"]:
-        w = int(math.ceil(original_w / downsample))
-        h = int(math.ceil(original_h / downsample))
-        r = int(x.shape[1] * args["ratio"])
+    r = int(x.shape[1] * args["ratio"])
 
-        # Re-init the generator if it hasn't already been initialized or device has changed.
-        if args["generator"] is None:
-            args["generator"] = init_generator(x.device)
-        elif args["generator"].device != x.device:
-            args["generator"] = init_generator(x.device, fallback=args["generator"])
-        
-        # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
-        # batch, which causes artifacts with use_rand, so force it to be off.
-        use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-        m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, 
-                                                      no_rand=not use_rand, generator=args["generator"])
-    else:
-        m, u = (merge.do_nothing, merge.do_nothing)
+    # Re-init the generator if it hasn't already been initialized or device has changed.
+    if args["generator"] is None:
+        args["generator"] = init_generator(x.device)
+    elif args["generator"].device != x.device:
+        args["generator"] = init_generator(x.device, fallback=args["generator"])
+    
+    m, u = merge.bipartite_soft_matching(x, r)
 
     m_a, u_a = (m, u) if args["merge_attn"]      else (merge.do_nothing, merge.do_nothing)
     m_c, u_c = (m, u) if args["merge_crossattn"] else (merge.do_nothing, merge.do_nothing)
     m_m, u_m = (m, u) if args["merge_mlp"]       else (merge.do_nothing, merge.do_nothing)
 
     return m_a, m_c, m_m, u_a, u_c, u_m  # Okay this is probably not very good
-
-
-
-
-
-
-
-def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    """
-    Make a patched class on the fly so we don't have to import any specific modules.
-    This patch applies ToMe to the forward function of the block.
-    """
-
-    class ToMeBlock(block_class):
-        # Save for unpatching later
-        _parent = block_class
-
-        def _forward(self, x: torch.Tensor, context: torch.Tensor = None) -> torch.Tensor:
-            m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(x, self._tome_info)
-
-            # This is where the meat of the computation happens
-            x = u_a(self.attn1(m_a(self.norm1(x)), context=context if self.disable_self_attn else None)) + x
-            x = u_c(self.attn2(m_c(self.norm2(x)), context=context)) + x
-            x = u_m(self.ff(m_m(self.norm3(x)))) + x
-
-            return x
-    
-    return ToMeBlock
-
-
-
-
 
 
 def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
@@ -155,6 +110,146 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
             hidden_states = u_m(ff_output) + hidden_states
 
             return hidden_states
+
+    return ToMeBlock
+
+
+def make_causal_wan_sa_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+    """
+    Make a patched class for a causal Wan attention block.
+    """
+    class ToMeBlock(block_class):
+        _parent = block_class
+
+        def _merge_4d(self, x, merge_fn):
+            # x: [B, L, N, D]  -> merge along L
+            B, L, N, D = x.shape
+            y = x.reshape(B, L, N * D)   # [B,L,C]
+            y = merge_fn(y)              # [B,L',C]
+            Lp = y.shape[1]
+            return y.reshape(B, Lp, N, D)
+
+        def _unmerge_4d(self, x, unmerge_fn):
+            B, Lp, N, D = x.shape
+            y = x.reshape(B, Lp, N * D)  # [B,L',C]
+            y = unmerge_fn(y)            # [B,L,C]
+            L  = y.shape[1]
+            return y.reshape(B, L, N, D)
+
+        def forward(self, x, seq_lens, grid_sizes, freqs, block_mask, kv_cache=None, current_start=0, current_end=0):
+            r"""
+            Args:
+                x(Tensor): Shape [B, L, num_heads, C / num_heads]
+                seq_lens(Tensor): Shape [B]
+                grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
+                freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+                block_mask (BlockMask)
+            """
+            b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+
+            # query, key, value function
+            def qkv_fn(x):
+                q = self.norm_q(self.q(x)).view(b, s, n, d)
+                k = self.norm_k(self.k(x)).view(b, s, n, d)
+                v = self.v(x).view(b, s, n, d)
+                return q, k, v
+
+            q, k, v = qkv_fn(x)
+
+            if kv_cache is None:
+                roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
+                roped_key = rope_apply(k, grid_sizes, freqs).type_as(v)
+
+                padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
+                padded_roped_query = torch.cat(
+                    [roped_query,
+                    torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
+                                device=q.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                padded_roped_key = torch.cat(
+                    [roped_key, torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
+                                            device=k.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                padded_v = torch.cat(
+                    [v, torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
+                                    device=v.device, dtype=v.dtype)],
+                    dim=1
+                )
+
+                x = flex_attention(
+                    query=padded_roped_query.transpose(2, 1),
+                    key=padded_roped_key.transpose(2, 1),
+                    value=padded_v.transpose(2, 1),
+                    block_mask=block_mask
+                )[:, :, :-padded_length].transpose(2, 1)
+            else:
+                frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+                current_start_frame = current_start // frame_seqlen
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                roped_key = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+
+                seq_lens = []
+                for i, c_start in enumerate(current_start):
+                    current_end = c_start + roped_query.shape[1]
+                    sink_tokens = self.sink_size * frame_seqlen
+                    # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
+                    kv_cache_size = kv_cache["k"].shape[1]
+                    num_new_tokens = roped_query.shape[1]
+                    if c_start + num_new_tokens >= kv_cache_size:
+                        kv_cache["global_end_index"][i].fill_(c_start)
+                        kv_cache["local_end_index"][i].fill_(kv_cache_size)
+                    if (current_end > kv_cache["global_end_index"][i].item()) and (
+                            num_new_tokens + kv_cache["local_end_index"][i].item() > kv_cache_size):
+                        # Calculate the number of new tokens added in this step
+                        # Shift existing cache content left to discard oldest tokens
+                        # Clone the source slice to avoid overlapping memory error
+                        num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"][i].item() - kv_cache_size
+                        num_rolled_tokens = kv_cache["local_end_index"][i].item() - num_evicted_tokens - sink_tokens
+                        kv_cache["k"][i:i+1, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                            kv_cache["k"][i:i+1, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                        kv_cache["v"][i:i+1, sink_tokens:sink_tokens + num_rolled_tokens] = \
+                            kv_cache["v"][i:i+1, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                        # Insert the new keys/values at the end
+                        local_end_index = kv_cache["local_end_index"][i].item() + current_end - \
+                            kv_cache["global_end_index"][i].item() - num_evicted_tokens
+                    else:
+                        local_end_index = kv_cache["local_end_index"][i].item() + current_end - kv_cache["global_end_index"][i].item()
+
+                    local_start_index = local_end_index - num_new_tokens
+                    kv_cache["k"][i:i+1, local_start_index:local_end_index] = roped_key[i:i+1]
+                    kv_cache["v"][i:i+1, local_start_index:local_end_index] = v[i:i+1]
+
+                    seq_lens.append(local_end_index)
+
+                    kv_cache["global_end_index"][i].fill_(current_end)
+                    kv_cache["local_end_index"][i].fill_(local_end_index)
+                
+                seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=roped_query.device)
+
+                # Merge here
+                m_a, m_c, m_m, u_a, u_c, u_m = compute_merge(roped_query, self._tome_info)
+                roped_query = self._merge_4d(roped_query, m_a)
+
+                x = flash_attn_interface.flash_attn_with_kvcache(
+                    q=roped_query,
+                    k_cache=kv_cache["k"][:, :seq_lens.max()],
+                    v_cache=kv_cache["v"][:, :seq_lens.max()],
+                    cache_seqlens=seq_lens,
+                )
+
+                # unmerge here
+                x = self._unmerge_4d(x, u_a)
+
+            # output
+            x = x.flatten(2)
+            x = self.o(x)
+            return x
 
     return ToMeBlock
 
@@ -248,30 +343,19 @@ def make_causal_wan_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch
     return ToMeBlock
 
 
-
-
 def hook_tome_model(model: torch.nn.Module, is_dit=False):
     """ Adds a forward pre hook to get the image size. This hook can be removed with remove_patch. """
     def hook(module, args):
-        token_size = (args[0].shape[2], args[0].shape[3]) if is_dit is False else (args[0].shape[1], 1)
+        token_size = (args[0].shape[2], args[0].shape[3]) if is_dit is False else args[0].shape[1]
         module._tome_info["size"] = token_size
         return None
 
     model._tome_info["hooks"].append(model.register_forward_pre_hook(hook))
 
 
-
-
-
-
-
-
 def apply_patch(
         diffusion_model: torch.nn.Module,
-        ratio: float = 0.5,
-        max_downsample: int = 1,
-        sx: int = 2, sy: int = 2,
-        use_rand: bool = True,
+        ratio: float = 0.2,
         merge_attn: bool = True,
         merge_crossattn: bool = False,
         merge_mlp: bool = False):
@@ -306,9 +390,6 @@ def apply_patch(
         "hooks": [],
         "args": {
             "ratio": ratio,
-            "max_downsample": max_downsample,
-            "sx": sx, "sy": sy,
-            "use_rand": use_rand,
             "generator": None,
             "merge_attn": merge_attn,
             "merge_crossattn": merge_crossattn,
@@ -317,25 +398,13 @@ def apply_patch(
     }
     hook_tome_model(diffusion_model, is_dit=True)
 
-    for _, module in diffusion_model.named_modules():
+    for module in diffusion_model.blocks:
         # If for some reason this has a different name, create an issue and I'll fix it
-        if isinstance_str(module, "CausalWanAttentionBlock"):
+        if isinstance_str(module.self_attn, "CausalWanSelfAttention"):
             module.__class__  = make_causal_wan_tome_block(module.__class__)
             module._tome_info = diffusion_model._tome_info
 
-            # # Something introduced in SD 2.0 (LDM only)
-            # if not hasattr(module, "disable_self_attn") and not is_diffusers:
-            #     module.disable_self_attn = False
-
-            # # Something needed for older versions of diffusers
-            # if not hasattr(module, "use_ada_layer_norm_zero") and is_diffusers:
-            #     module.use_ada_layer_norm = False
-            #     module.use_ada_layer_norm_zero = False
-
-    return model
-
-
-
+    return diffusion_model
 
 
 def remove_patch(model: torch.nn.Module):

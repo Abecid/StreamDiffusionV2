@@ -11,6 +11,8 @@ inference pipeline on a single GPU:
 from causvid.models.wan.causal_stream_inference import CausalStreamInferencePipeline
 from diffusers.utils import export_to_video
 from causvid.data import TextDataset
+import tomesd
+
 from omegaconf import OmegaConf
 import argparse
 import torch
@@ -23,6 +25,15 @@ import torchvision
 import torchvision.transforms.functional as TF
 from einops import rearrange
 
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def load_mp4_as_tensor(
     video_path: str,
@@ -106,7 +117,9 @@ class SingleGPUInferencePipeline:
         # Initialize pipeline
         self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
         self.pipeline.to(device=str(device), dtype=torch.bfloat16)
-        
+        self.tomesd_ratio = config.get("tomesd_ratio", 0.2)
+        tomesd.apply_patch(self.pipeline.generator.model, ratio=self.tomesd_ratio, merge_attn=True, merge_crossattn=False, merge_mlp=False)
+
         # Performance tracking
         self.t_dit = 100.0
         self.t_total = 100.0
@@ -249,8 +262,13 @@ class SingleGPUInferencePipeline:
         video = np.concatenate(video_list, axis=0)
         fps_avg = np.mean(np.array(fps_list))
         self.logger.info(f"Video shape: {video.shape}, Average FPS: {fps_avg:.4f}")
-        
-        output_path = os.path.join(output_folder, f"output_{0:03d}.mp4")
+
+        # Current_datetime: MMDD_HHMM
+        current_datetime = time.strftime("%m%d_%H%M", time.localtime())
+
+        tomesd_ratio_str = str(self.tomesd_ratio).replace('.', '_')
+
+        output_path = os.path.join(output_folder, f"{current_datetime}_{tomesd_ratio_str}.mp4")
         export_to_video(video, output_path, fps=fps)
         self.logger.info(f"Video saved to: {output_path}")
         
@@ -258,6 +276,8 @@ class SingleGPUInferencePipeline:
 
 
 def main():
+    set_seed(42)
+
     """Main function for the single GPU inference pipeline."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", type=str, required=True, help="Configuration file path")
@@ -270,6 +290,7 @@ def main():
     parser.add_argument("--width", type=int, default=832, help="Video width")
     parser.add_argument("--fps", type=int, default=16, help="Output video fps")
     parser.add_argument("--step", type=int, default=2, help="Step")
+    parser.add_argument("--tomesd_ratio", type=float, default=0.2, help="ToMe pruning ratio")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
