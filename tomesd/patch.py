@@ -4,6 +4,7 @@ from typing import Type, Dict, Any, Tuple, Callable
 
 from . import merge
 from .utils import isinstance_str, init_generator
+from causvid.models.wan.causal_model import flash_attn_interface
 
 
 
@@ -18,7 +19,9 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any]) -> Tuple[Callable,
     elif args["generator"].device != x.device:
         args["generator"] = init_generator(x.device, fallback=args["generator"])
     
-    m, u = merge.bipartite_soft_matching(x, r)
+    B, L, N, D = x.shape
+    y = x.reshape(B, L, N * D)   # [B,L,C]
+    m, u = merge.bipartite_soft_matching(y, r)
 
     m_a, u_a = (m, u) if args["merge_attn"]      else (merge.do_nothing, merge.do_nothing)
     m_c, u_c = (m, u) if args["merge_crossattn"] else (merge.do_nothing, merge.do_nothing)
@@ -189,9 +192,9 @@ def make_causal_wan_sa_tome_block(block_class: Type[torch.nn.Module]) -> Type[to
             else:
                 frame_seqlen = math.prod(grid_sizes[0][1:]).item()
                 current_start_frame = current_start // frame_seqlen
-                roped_query = causal_rope_apply(
+                roped_query = self.causal_rope_apply(
                     q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-                roped_key = causal_rope_apply(
+                roped_key = self.causal_rope_apply(
                     k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
                 seq_lens = []
@@ -399,10 +402,11 @@ def apply_patch(
     hook_tome_model(diffusion_model, is_dit=True)
 
     for module in diffusion_model.blocks:
+        module_sa = module.self_attn
         # If for some reason this has a different name, create an issue and I'll fix it
-        if isinstance_str(module.self_attn, "CausalWanSelfAttention"):
-            module.__class__  = make_causal_wan_tome_block(module.__class__)
-            module._tome_info = diffusion_model._tome_info
+        if isinstance_str(module_sa, "CausalWanSelfAttention"):
+            module_sa.__class__  = make_causal_wan_sa_tome_block(module_sa.__class__)
+            module_sa._tome_info = diffusion_model._tome_info
 
     return diffusion_model
 

@@ -26,39 +26,6 @@ flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune")
 
 
-def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
-    n, c = x.size(2), x.size(3) // 2
-
-    # split freqs
-    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-
-    # loop over samples
-    output = []
-
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
-
-        sf = start_frame[i].item() if isinstance(start_frame, torch.Tensor) else start_frame
-
-        # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
-            seq_len, n, -1, 2))
-        freqs_i = torch.cat([
-            freqs[0][sf:sf + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ],
-            dim=-1).reshape(seq_len, 1, -1)
-
-        # apply rotary embedding
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-
-        # append to collection
-        output.append(x_i)
-    return torch.stack(output).type_as(x)
-
-
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -85,6 +52,38 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+    def causal_rope_apply(self, x, grid_sizes, freqs, start_frame=0):
+        n, c = x.size(2), x.size(3) // 2
+
+        # split freqs
+        freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+
+        # loop over samples
+        output = []
+
+        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+            seq_len = f * h * w
+
+            sf = start_frame[i].item() if isinstance(start_frame, torch.Tensor) else start_frame
+
+            # precompute multipliers
+            x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+                seq_len, n, -1, 2))
+            freqs_i = torch.cat([
+                freqs[0][sf:sf + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ],
+                dim=-1).reshape(seq_len, 1, -1)
+
+            # apply rotary embedding
+            x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+            x_i = torch.cat([x_i, x[i, seq_len:]])
+
+            # append to collection
+            output.append(x_i)
+        return torch.stack(output).type_as(x)
 
     def forward(self, x, seq_lens, grid_sizes, freqs, block_mask, kv_cache=None, current_start=0, current_end=0):
         r"""
@@ -139,9 +138,9 @@ class CausalWanSelfAttention(nn.Module):
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
             current_start_frame = current_start // frame_seqlen
-            roped_query = causal_rope_apply(
+            roped_query = self.causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-            roped_key = causal_rope_apply(
+            roped_key = self.causal_rope_apply(
                 k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
 
             seq_lens = []
