@@ -118,7 +118,8 @@ class SingleGPUInferencePipeline:
         self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
         self.pipeline.to(device=str(device), dtype=torch.bfloat16)
         self.tomesd_ratio = config.get("tomesd_ratio", 0.2)
-        tomesd.apply_patch(self.pipeline.generator.model, ratio=self.tomesd_ratio, merge_attn=True, merge_crossattn=False, merge_mlp=False)
+        if self.tomesd_ratio > 0:
+            tomesd.apply_patch(self.pipeline.generator.model, ratio=self.tomesd_ratio, merge_attn=True, merge_crossattn=False, merge_mlp=False)
 
         # Performance tracking
         self.t_dit = 100.0
