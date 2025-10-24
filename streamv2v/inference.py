@@ -169,6 +169,7 @@ class SingleGPUInferencePipeline:
         self.logger.info(f"Processed {self.processed}, time: {t:.4f} s, FPS: {fps_test:.4f}")
         self.start_time = self.end_time
 
+    @torch.inference_mode()
     def run_inference(self, input_video_original: torch.Tensor, prompts: list, 
                      num_chuncks: int, chunck_size: int, noise_scale: float, 
                      output_folder: str, fps: int, num_steps: int):
