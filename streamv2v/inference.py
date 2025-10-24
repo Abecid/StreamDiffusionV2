@@ -20,6 +20,7 @@ import os
 import time
 import numpy as np
 import logging
+import threading
 
 import torchvision
 import torchvision.transforms.functional as TF
@@ -117,7 +118,7 @@ class SingleGPUInferencePipeline:
         # Initialize pipeline
         self.pipeline = CausalStreamInferencePipeline(config, device=str(device))
         self.pipeline.to(device=str(device), dtype=torch.bfloat16)
-        self.tomesd_ratio = config.get("tomesd_ratio", 0.2)
+        self.tomesd_ratio = config.get("tomesd_ratio", 0.0)
         if self.tomesd_ratio > 0:
             tomesd.apply_patch(self.pipeline.generator.model, ratio=self.tomesd_ratio, merge_attn=True, merge_crossattn=False, merge_mlp=False)
 
@@ -148,7 +149,26 @@ class SingleGPUInferencePipeline:
             current_end=current_end
         )
         return denoised_pred
-    
+
+    def _decode_thread(self, denoised_pred, results, idx, num_frames):
+        """Runs VAE decode on its own thread/stream."""
+        decode_stream = torch.cuda.Stream(device=torch.device("cuda", 0))
+
+        with torch.cuda.stream(decode_stream):
+            video = self.pipeline.vae.stream_decode_to_pixel(denoised_pred[[-1]])
+            video = (video * 0.5 + 0.5).clamp(0, 1)
+            video = video[0].permute(0, 2, 3, 1).contiguous()
+
+            results[idx] = video.cpu().float().numpy()  # syncs only this thread’s stream
+
+        decode_stream.synchronize()
+        self.end_time = time.time()
+        t = self.end_time - self.start_time
+        fps_test = num_frames/t
+        self.fps_list.append(fps_test)
+        self.logger.info(f"Processed {self.processed}, time: {t:.4f} s, FPS: {fps_test:.4f}")
+        self.start_time = self.end_time
+
     def run_inference(self, input_video_original: torch.Tensor, prompts: list, 
                      num_chuncks: int, chunck_size: int, noise_scale: float, 
                      output_folder: str, fps: int, num_steps: int):
@@ -163,7 +183,7 @@ class SingleGPUInferencePipeline:
         results = {}
         save_results = 0
 
-        fps_list = []
+        self.fps_list = []
         
         # Initialize variables
         start_idx = 0
@@ -172,7 +192,7 @@ class SingleGPUInferencePipeline:
         current_end = self.pipeline.frame_seq_length * 2
         
         torch.cuda.synchronize()
-        start_time = time.time()
+        self.start_time = time.time()
         
         # Process first chunk (initialization)
         if end_idx <= input_video_original.shape[2]:
@@ -251,17 +271,26 @@ class SingleGPUInferencePipeline:
             
                 # Update timing
                 torch.cuda.synchronize()
-                end_time = time.time()
-                t = end_time - start_time
+                self.end_time = time.time()
+                t = self.end_time - self.start_time
                 fps_test = inp.shape[2]/t
-                fps_list.append(fps_test)
+                self.fps_list.append(fps_test)
                 self.logger.info(f"Processed {self.processed}, time: {t:.4f} s, FPS: {fps_test:.4f}")
-                start_time = end_time
+                self.start_time = self.end_time
+
+                # # launch decode in its own thread
+                # decode_thread = threading.Thread(
+                #     target=self._decode_thread,
+                #     args=(denoised_pred, results, save_results, inp.shape[2]),
+                #     daemon=True,
+                # )
+                # decode_thread.start()
+                # save_results += 1
         
         # Save final video
         video_list = [results[i] for i in range(num_chuncks)]
         video = np.concatenate(video_list, axis=0)
-        fps_avg = np.mean(np.array(fps_list))
+        fps_avg = np.mean(np.array(self.fps_list))
         self.logger.info(f"Video shape: {video.shape}, Average FPS: {fps_avg:.4f}")
 
         # Current_datetime: MMDD_HHMM
@@ -291,7 +320,7 @@ def main():
     parser.add_argument("--width", type=int, default=832, help="Video width")
     parser.add_argument("--fps", type=int, default=16, help="Output video fps")
     parser.add_argument("--step", type=int, default=2, help="Step")
-    parser.add_argument("--tomesd_ratio", type=float, default=0.2, help="ToMe pruning ratio")
+    parser.add_argument("--tomesd_ratio", type=float, default=0.0, help="ToMe pruning ratio")
     args = parser.parse_args()
     
     torch.set_grad_enabled(False)
